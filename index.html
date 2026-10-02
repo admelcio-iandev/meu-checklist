@@ -259,6 +259,13 @@
       color: var(--text-muted);
     }
 
+    .sync-indicator {
+      font-size: 0.75rem;
+      color: var(--primary);
+      text-align: center;
+      padding: 4px;
+    }
+
     .hidden { display: none !important; }
   </style>
 </head>
@@ -291,6 +298,8 @@
       </div>
       <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 0.8rem;" onclick="logout()">Sair</button>
     </header>
+
+    <div id="syncStatus" class="sync-indicator hidden">Sincronizando com a nuvem...</div>
 
     <nav class="tabs">
       <button class="tab-btn active" onclick="switchTab('editTab')">1. Criação / Edição</button>
@@ -366,7 +375,7 @@
      ========================================================================== */
   function sanitizeHTML(str) {
     const temp = document.createElement('div');
-    temp.textContent = str;
+    temp.textContent = str || '';
     return temp.innerHTML;
   }
 
@@ -380,7 +389,7 @@
     document.getElementById('authToggle').innerText = isRegisterMode ? "Já tem conta? Faça Login" : "Não tem conta? Cadastre-se";
   }
 
-  function handleAuth() {
+  async function handleAuth() {
     const userVal = document.getElementById('username').value.trim();
     const passVal = document.getElementById('password').value.trim();
 
@@ -395,7 +404,7 @@
     document.getElementById('authScreen').classList.add('hidden');
     document.getElementById('mainApp').classList.remove('hidden');
 
-    loadUserData();
+    await loadUserData();
   }
 
   function logout() {
@@ -427,22 +436,23 @@
     return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
   }
 
-  function loadUserData() {
+  async function loadUserData() {
+    // 1. Tenta carregar do LocalStorage local primeiro
     const allData = getStorageData();
     currentChecklists = allData[currentUser] || [];
+    
     populateEditDropdown();
     loadChecklistForEdit();
-    
-    syncFromGoogleSheets();
+
+    // 2. Busca os dados atualizados na nuvem (Google Sheets)
+    await syncFromGoogleSheets();
   }
 
-  function saveUserData() {
+  function saveLocalDataOnly() {
     const allData = getStorageData();
     allData[currentUser] = currentChecklists;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(allData));
     showToast();
-
-    syncToGoogleSheets();
   }
 
   function showToast() {
@@ -452,30 +462,55 @@
     autosaveTimeout = setTimeout(() => toast.classList.remove('visible'), 2000);
   }
 
-  /* Integracao Google Sheets */
+  /* Sincronização Robusta com Google Sheets */
   function syncToGoogleSheets() {
-    if (!GOOGLE_SCRIPT_URL) return;
+    if (!GOOGLE_SCRIPT_URL || !currentUser) return;
+
+    const payload = JSON.stringify({ user: currentUser, checklists: currentChecklists });
+
+    // Usa fetch via POST
     fetch(GOOGLE_SCRIPT_URL, {
       method: 'POST',
       mode: 'no-cors',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user: currentUser, checklists: currentChecklists })
-    }).catch(err => console.error("Erro na sincronização:", err));
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: payload
+    }).catch(err => console.error("Erro na sincronização de envio:", err));
   }
 
-  function syncFromGoogleSheets() {
-    if (!GOOGLE_SCRIPT_URL) return;
-    fetch(`${GOOGLE_SCRIPT_URL}?user=${currentUser}`)
-      .then(res => res.json())
-      .then(data => {
-        if (data && data.checklists) {
+  async function syncFromGoogleSheets() {
+    if (!GOOGLE_SCRIPT_URL || !currentUser) return;
+
+    const syncIndicator = document.getElementById('syncStatus');
+    syncIndicator.classList.remove('hidden');
+
+    try {
+      const response = await fetch(`${GOOGLE_SCRIPT_URL}?user=${encodeURIComponent(currentUser)}`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data && Array.isArray(data.checklists)) {
           currentChecklists = data.checklists;
-          saveUserData();
+          
+          // Atualiza o localStorage com os dados vindos da nuvem
+          const allData = getStorageData();
+          allData[currentUser] = currentChecklists;
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(allData));
+
+          // Atualiza a interface
           populateEditDropdown();
           loadChecklistForEdit();
+
+          const activeTab = document.querySelector('.tab-content.active');
+          if (activeTab && activeTab.id === 'runTab') {
+            populateRunnerDropdown();
+            renderRunner();
+          }
         }
-      })
-      .catch(err => console.log("Modo offline / sem resposta do Sheets"));
+      }
+    } catch (err) {
+      console.log("Serviço de busca remota indisponível/offline. Usando cache local.", err);
+    } finally {
+      syncIndicator.classList.add('hidden');
+    }
   }
 
   /* ==========================================================================
@@ -492,8 +527,11 @@
       select.appendChild(opt);
     });
 
-    if (selectedChecklistId) {
+    if (selectedChecklistId && currentChecklists.some(c => c.id === selectedChecklistId)) {
       select.value = selectedChecklistId;
+    } else {
+      select.value = 'NEW';
+      selectedChecklistId = null;
     }
   }
 
@@ -573,7 +611,14 @@
       }
     }
 
-    saveUserData();
+    saveLocalDataOnly();
+    
+    // Dispara sincronização remota com debounce
+    clearTimeout(autosaveTimeout);
+    autosaveTimeout = setTimeout(() => {
+      syncToGoogleSheets();
+    }, 800);
+
     const select = document.getElementById('editSelect');
     const opt = select.querySelector(`option[value="${selectedChecklistId}"]`);
     if (opt) opt.textContent = titleVal || "Sem título";
@@ -585,7 +630,8 @@
     if (confirm("Tem certeza que deseja excluir este checklist permanentemente?")) {
       currentChecklists = currentChecklists.filter(c => c.id !== selectedChecklistId);
       selectedChecklistId = null;
-      saveUserData();
+      saveLocalDataOnly();
+      syncToGoogleSheets();
       populateEditDropdown();
       loadChecklistForEdit();
     }
@@ -650,7 +696,8 @@
     if (cl) {
       const item = cl.items.find(i => i.id === itemId);
       if (item) item.checked = isChecked;
-      saveUserData();
+      saveLocalDataOnly();
+      syncToGoogleSheets();
       renderRunner();
     }
   }
@@ -670,7 +717,8 @@
 
     if (cl && confirm("Deseja desmarcar todos os itens deste checklist?")) {
       cl.items.forEach(i => i.checked = false);
-      saveUserData();
+      saveLocalDataOnly();
+      syncToGoogleSheets();
       renderRunner();
     }
   }
